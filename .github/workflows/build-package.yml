@@ -1,0 +1,262 @@
+name: Build Session
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-package.yml"
+      - "packaging/**"
+      - "session/**"
+      - "VERSION"
+
+env:
+  NFPM_VERSION: "2.47.0"
+  PULP_CLI_VERSION: "0.41.1"
+  MECHANIX_PACKAGER_VERSION: "v0.0.3"
+  PACKAGE_NAME: "mechanix-session"
+  # Packages are built on every branch, but uploaded only from main and canary.
+  PUBLISH: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/canary' }}
+
+jobs:
+  version:
+    name: Resolve rpm release
+    runs-on: ubuntu-24.04-arm
+    environment: canary
+    outputs:
+      rpm_release: ${{ steps.resolve.outputs.rpm_release }}
+
+    env:
+      MECHA_PULP_USERNAME: ${{ secrets.MECHA_PULP_USERNAME }}
+      MECHA_PULP_PASSWORD: ${{ secrets.MECHA_PULP_PASSWORD }}
+      MECHA_PULP_API_URL: ${{ vars.MECHA_PULP_API_URL }}
+
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v4
+
+      - name: Install mechanix-packager
+        run: |
+          mkdir -p "$RUNNER_TEMP/mechanix-packager"
+          curl -fsSL "https://github.com/mecha-org/mechanix-packager/archive/refs/tags/${MECHANIX_PACKAGER_VERSION}.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/mechanix-packager" --strip-components=1
+          echo "MECHANIX_PACKAGER_DIR=$RUNNER_TEMP/mechanix-packager" >> "$GITHUB_ENV"
+
+      # One release number per run, shared by every Fedora repo.
+      - name: Resolve rpm release
+        id: resolve
+        run: |
+          set -euo pipefail
+          RPM_JSON=$(python3 "$MECHANIX_PACKAGER_DIR/resolve_version.py" --format rpm --upstream "$(cat VERSION)")
+          echo "rpm_release=$(echo "$RPM_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
+
+  # The package is noarch: the same rpm goes to each Fedora repo.
+  rpm:
+    name: rpm (fc${{ matrix.fedora }})
+    needs: version
+    runs-on: ubuntu-24.04-arm
+    environment: canary
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora: [44, 45]
+
+    env:
+      FEDORA: ${{ matrix.fedora }}
+      RPM_RELEASE: ${{ needs.version.outputs.rpm_release }}
+      MECHA_PULP_USERNAME: ${{ secrets.MECHA_PULP_USERNAME }}
+      MECHA_PULP_PASSWORD: ${{ secrets.MECHA_PULP_PASSWORD }}
+      MECHA_PULP_API_URL: ${{ vars.MECHA_PULP_API_URL }}
+      MECHA_PULP_RPM_CHANNEL: ${{ vars.MECHA_PULP_RPM_CHANNEL }}
+
+    steps:
+      - name: Install nfpm
+        run: |
+          curl -fsSL -o nfpm.deb "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_arm64.deb"
+          sudo dpkg -i nfpm.deb
+          rm nfpm.deb
+
+      - name: Install mechanix-packager
+        run: |
+          mkdir -p "$RUNNER_TEMP/mechanix-packager"
+          curl -fsSL "https://github.com/mecha-org/mechanix-packager/archive/refs/tags/${MECHANIX_PACKAGER_VERSION}.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/mechanix-packager" --strip-components=1
+          echo "MECHANIX_PACKAGER_DIR=$RUNNER_TEMP/mechanix-packager" >> "$GITHUB_ENV"
+
+      - name: Setup | Checkout
+        uses: actions/checkout@v4
+
+      - name: Package RPM
+        run: |
+          set -euo pipefail
+          python3 "$MECHANIX_PACKAGER_DIR/package.py" ./dist --formats rpm --version "$(cat VERSION)" --release "$RPM_RELEASE"
+
+          RPM_FILE=$(find ./dist -name "${PACKAGE_NAME}-*-${RPM_RELEASE}.noarch.rpm" -type f | head -n1)
+          [ -n "$RPM_FILE" ] || { echo "[ERROR] expected ${PACKAGE_NAME} rpm with release ${RPM_RELEASE} not built"; ls -la ./dist; exit 1; }
+          echo "[INFO] built $(basename "$RPM_FILE")"
+          echo "RPM_FILE=$RPM_FILE" >> "$GITHUB_ENV"
+
+      - name: Setup | Pulp CLI
+        if: env.PUBLISH == 'true'
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/pulp-cli"
+          "$RUNNER_TEMP/pulp-cli/bin/pip" install --quiet "pulp-cli==${PULP_CLI_VERSION}"
+          echo "$RUNNER_TEMP/pulp-cli/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Pulp CLI
+        if: env.PUBLISH == 'true'
+        run: |
+          set -euo pipefail
+          PULP_API_URL="$(printf '%s' "${MECHA_PULP_API_URL}" | tr -d '[:space:]')"
+          PULP_API_URL="${PULP_API_URL%/}"
+          [ -n "$PULP_API_URL" ] || { echo "[ERROR] MECHA_PULP_API_URL is empty"; exit 1; }
+          [ -n "$MECHA_PULP_RPM_CHANNEL" ] || { echo "[ERROR] MECHA_PULP_RPM_CHANNEL is empty"; exit 1; }
+          pulp config create \
+            --username "$MECHA_PULP_USERNAME" \
+            --password "$MECHA_PULP_PASSWORD" \
+            --base-url "$PULP_API_URL" \
+            --overwrite
+
+      # Uploading also signs the package (repo signing service) and publishes the repo.
+      - name: Publish RPM
+        if: env.PUBLISH == 'true'
+        run: |
+          set -euo pipefail
+          REPO="repo-rpm-fedora-${FEDORA}-${MECHA_PULP_RPM_CHANNEL}"
+          echo "[INFO] Uploading $(basename "$RPM_FILE") to $REPO"
+          pulp rpm content upload --repository "$REPO" --file "$RPM_FILE"
+
+      - name: Verify package is served
+        if: env.PUBLISH == 'true'
+        run: |
+          set -euo pipefail
+          BASE="https://pkg.mecha.so/repo/rpm/fedora-${FEDORA}/${MECHA_PULP_RPM_CHANNEL}"
+          WANT="$(basename "$RPM_FILE")"
+          for _ in $(seq 1 40); do
+            PRIMARY=$(curl -fsSL "$BASE/repodata/repomd.xml" | grep -oP 'href="\Krepodata/[^"]*primary\.xml[^"]*')
+            if curl -fsSL "$BASE/$PRIMARY" | { zcat 2>/dev/null || cat; } | grep "<location href=\"[^\"]*/${WANT}\"" >/dev/null; then
+              echo "[INFO] served at $BASE: $WANT"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "[ERROR] $WANT not served at $BASE after 10 minutes"
+          exit 1
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mechanix-session-rpm-fc${{ matrix.fedora }}
+          path: ./dist/*.rpm
+
+  deb:
+    name: deb (trixie)
+    runs-on: ubuntu-24.04-arm
+    environment: canary
+
+    env:
+      MECHA_PULP_USERNAME: ${{ secrets.MECHA_PULP_USERNAME }}
+      MECHA_PULP_PASSWORD: ${{ secrets.MECHA_PULP_PASSWORD }}
+      MECHA_PULP_API_URL: ${{ vars.MECHA_PULP_API_URL }}
+      MECHA_PULP_DEBS_REPOSITORY_NAME: ${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}
+      MECHA_PULP_DEB_DISTRIBUTION: ${{ vars.MECHA_PULP_DEB_DISTRIBUTION }}
+
+    steps:
+      - name: Install nfpm
+        run: |
+          curl -fsSL -o nfpm.deb "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_arm64.deb"
+          sudo dpkg -i nfpm.deb
+          rm nfpm.deb
+
+      - name: Install mechanix-packager
+        run: |
+          mkdir -p "$RUNNER_TEMP/mechanix-packager"
+          curl -fsSL "https://github.com/mecha-org/mechanix-packager/archive/refs/tags/${MECHANIX_PACKAGER_VERSION}.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/mechanix-packager" --strip-components=1
+          echo "MECHANIX_PACKAGER_DIR=$RUNNER_TEMP/mechanix-packager" >> "$GITHUB_ENV"
+
+      - name: Setup | Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve deb release
+        id: version
+        run: |
+          set -euo pipefail
+          DEB_JSON=$(python3 "$MECHANIX_PACKAGER_DIR/resolve_version.py" --format deb --upstream "$(cat VERSION)")
+          echo "deb_release=$(echo "$DEB_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
+
+      - name: Package DEB
+        run: |
+          set -euo pipefail
+          python3 "$MECHANIX_PACKAGER_DIR/package.py" ./dist --formats deb --version "$(cat VERSION)" --release "${{ steps.version.outputs.deb_release }}"
+
+          DEB_FILE=$(find ./dist -name "${PACKAGE_NAME}_*.deb" -type f | head -n1)
+          [ -f "$DEB_FILE" ] || { echo "[ERROR] deb not built"; ls -la ./dist; exit 1; }
+          echo "[INFO] built $(basename "$DEB_FILE")"
+          echo "DEB_FILE=$DEB_FILE" >> "$GITHUB_ENV"
+
+      - name: Setup | Pulp CLI
+        if: env.PUBLISH == 'true'
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/pulp-cli"
+          "$RUNNER_TEMP/pulp-cli/bin/pip" install --quiet "pulp-cli==${PULP_CLI_VERSION}" pulp-cli-deb
+          echo "$RUNNER_TEMP/pulp-cli/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Pulp CLI
+        if: env.PUBLISH == 'true'
+        run: |
+          set -euo pipefail
+          PULP_API_URL="$(printf '%s' "${MECHA_PULP_API_URL}" | tr -d '[:space:]')"
+          PULP_API_URL="${PULP_API_URL%/}"
+          [ -n "$PULP_API_URL" ] || { echo "[ERROR] MECHA_PULP_API_URL is empty"; exit 1; }
+          pulp config create \
+            --username "$MECHA_PULP_USERNAME" \
+            --password "$MECHA_PULP_PASSWORD" \
+            --base-url "$PULP_API_URL" \
+            --overwrite
+
+      - name: Publish DEB
+        if: env.PUBLISH == 'true'
+        env:
+          DEB_SIGNING_SERVICE_HREF: /pulp/api/v3/signing-services/01a06111-aea8-744f-89a8-0d86ae025e5d/
+        run: |
+          set -euo pipefail
+          echo "[INFO] Uploading $DEB_FILE to $MECHA_PULP_DEBS_REPOSITORY_NAME"
+          pulp deb content upload \
+            --repository="$MECHA_PULP_DEBS_REPOSITORY_NAME" \
+            --file="$DEB_FILE" \
+            --distribution="$MECHA_PULP_DEB_DISTRIBUTION" \
+            --component=main
+
+          REPO_HREF=$(pulp deb repository show --name="$MECHA_PULP_DEBS_REPOSITORY_NAME" | jq -r '.pulp_href')
+          PULP_API_URL="$(printf '%s' "${MECHA_PULP_API_URL}" | tr -d '[:space:]')"
+          PULP_API_URL="${PULP_API_URL%/}"
+
+          TASK_HREF=$(curl -sf -u "${MECHA_PULP_USERNAME}:${MECHA_PULP_PASSWORD}" \
+            -X POST "${PULP_API_URL}/pulp/api/v3/publications/deb/apt/" \
+            -H "Content-Type: application/json" \
+            -d "{\"repository\": \"${REPO_HREF}\", \"signing_service\": \"${DEB_SIGNING_SERVICE_HREF}\"}" \
+            | jq -r '.task')
+
+          STATE=""
+          for _ in $(seq 1 60); do
+            TASK_JSON=$(curl -sf -u "${MECHA_PULP_USERNAME}:${MECHA_PULP_PASSWORD}" "${PULP_API_URL}${TASK_HREF}")
+            STATE=$(echo "$TASK_JSON" | jq -r '.state')
+            [ "$STATE" = "completed" ] && break
+            if [ "$STATE" = "failed" ] || [ "$STATE" = "canceled" ]; then
+              echo "[ERROR] DEB publication task ${STATE}: $(echo "$TASK_JSON" | jq -r '.error')"
+              exit 1
+            fi
+            sleep 2
+          done
+          [ "$STATE" = "completed" ] || { echo "[ERROR] DEB publication task did not complete in time"; exit 1; }
+          echo "[INFO] DEB publication: $(echo "$TASK_JSON" | jq -r '.created_resources[0]')"
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mechanix-session-deb
+          path: ./dist/*.deb

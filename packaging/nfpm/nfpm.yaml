@@ -1,0 +1,57 @@
+name: mechanix-session
+# Only scripts and config: one package for every architecture.
+arch: all
+platform: linux
+version: "${PKG_VERSION}"
+release: "${PKG_RELEASE}"
+section: utils
+priority: optional
+maintainer: "Mufeed Ali <mufeeda@mechasystems.com>"
+description: Session for Mechanix OS
+homepage: https://github.com/mecha-org/mechanix-session
+license: BSD
+
+depends:
+  - mechanix-compositor
+
+contents:
+  - src: ./session/mechanix-session
+    dst: /usr/bin/mechanix-session
+    file_info:
+      mode: 0755
+
+  - src: ./session/mechanix.desktop
+    dst: /usr/share/wayland-sessions/mechanix.desktop
+    file_info:
+      mode: 0644
+
+  - src: ./session/mechanix-compositor.service
+    dst: /usr/lib/systemd/user/mechanix-compositor.service
+    file_info:
+      mode: 0644
+
+  - src: ./session/mechanix-shell.service
+    dst: /usr/lib/systemd/user/mechanix-shell.service
+    file_info:
+      mode: 0644
+
+  - src: ./session/mechanix-session.target
+    dst: /usr/lib/systemd/user/mechanix-session.target
+    file_info:
+      mode: 0644
+
+  - src: ./session/mechanix-session-shutdown.target
+    dst: /usr/lib/systemd/user/mechanix-session-shutdown.target
+    file_info:
+      mode: 0644
+
+  - src: ./session/mechanix-portals.conf
+    dst: /usr/share/xdg-desktop-portal/mechanix-portals.conf
+    file_info:
+      mode: 0644
+
+  - src: ./session/xdg-desktop-portal-wlr.conf
+    dst: /etc/xdg/xdg-desktop-portal-wlr/mechanix
+    type: config
+    file_info:
+      mode: 0644
